@@ -1,0 +1,608 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Simple EC2 launcher
+Metadata:
+  Name: simple-ec2
+  Version: 1
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Basic configuration
+        Parameters:
+          - Name
+          - VpcId
+          - InstanceType
+          - DataVolumeSize
+          - BastionSecurityGroup
+      -
+        Label:
+          default: Advanced configuration
+        Parameters:
+          - AmiId
+          - CreateTimeout
+          - EnableAutoRestacking
+          - EnableDomainName
+          - HostedZoneName
+          - IgnoreBootstrapErr
+          - InstanceIAMPolicy
+          - KeyName
+          - OSVersion
+          - Subnets
+          - Timestamp
+          - UserDataScriptBucket
+          - UserDataScriptName
+          - UserDataScriptEnvVar
+      -
+        Label:
+          default: Debugging configuration (DO NOT MODIFY)
+        Parameters:
+          - LambdaCodeBucket
+          - LambdaCodePath
+    ParameterLabels:
+      AmiId:
+        default: AMI ID
+      InstanceType:
+        default: Instance type
+      DataVolumeSize:
+        default: Size of data volume (in GB)
+      KeyName:
+        default: Key pair name (optional)
+      Name:
+        default: Name
+      OSVersion:
+        default: OS version
+      Subnets:
+        default: Subnets for instance to run in
+      VpcId:
+        default: VPC ID
+      UserDataScriptBucket:
+        default: S3 bucket containing the userdata script
+      UserDataScriptName:
+        default: Name of the script file in the S3 bucket
+      UserDataScriptEnvVar:
+        default: Environment variables for bootstrap script
+      BastionSecurityGroup:
+        default: Security group of bastion
+      EnableAutoRestacking:
+        default: Enable automatic restacking
+      InstanceIAMPolicy:
+        default: Instance IAM Policy
+      EnableDomainName:
+        default: Enable Domain Name
+      HostedZoneName:
+        default: Hosted Zone Name
+      Timestamp:
+        default: Unique timestamp to trigger data snapshot creation
+      IgnoreBootstrapErr:
+        default: whether or not to ignore error with userdata bootstrap script
+      CreateTimeout:
+        default: Ability to add more time on creation in case of complex install
+  cfn-lint:
+    config:
+      ignore_checks:
+      - E3002
+Parameters:
+  AmiId:
+    AllowedPattern: ^(?:ami-[0-9a-f]{8}|ami-[0-9a-f]{17}|Auto)$
+    Default: ami-076cbb27c223df09a # us-west-2 Ubuntu AMI
+    Description: >-
+      The ID of the AMI to use for the instances
+    Type: String
+  InstanceType:
+    Default: m5.xlarge # reccommended m5.xlarge
+    Description: >-
+      The instance type of the hosts
+    Type: String
+  DataVolumeSize:
+    Default: 200
+    Description: >-
+      Size of data volume (in GB)
+    Type: String
+  KeyName:
+    Default: ""
+    Description: >-
+      The name of the key pair for the instances. This should already exist in your account
+    Type: String
+  Name:
+    AllowedPattern: "[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
+    ConstraintDescription: Must begin with a letter and only contain alphanumeric and hyphens
+    Description: >-
+      The base name of the resources (e.g. instances, asgs). Must be unique.
+    Type: String
+  OSVersion:
+    Default: ubuntu
+    Description: >-
+      The OS version of the AMI to use for the instances. This value is only
+      used when the AMI ID is set to "Auto".
+    Type: String
+  Subnets:
+    Default: Auto
+    Description: >-
+      Comma separated list of subnets in which to launch the instances or "Auto"
+      to use the standard private subnet
+    Type: String
+  VpcId:
+    Description: >-
+      The ID of the VPC in which to launch the instances
+    Type: AWS::EC2::VPC::Id
+  UserDataScriptBucket:
+    Description: >-
+      S3 bucket containing the userdata script if exists
+    Default: ""
+    Type: String
+  UserDataScriptName:
+    Description: >-
+      Name of userdata script that will be used for bootstrapping the EC2 instance
+    Default: ""
+    Type: String
+  UserDataScriptEnvVar:
+    Description: >-
+      Environment variables to pass to bootstrap script. Format is "key1=value1 key2=value2"
+    Default: ""
+    Type: String
+  BastionSecurityGroup:
+    Description: >-
+      Id of bastion security group to allow ssh into bastion instances
+    Default: "None"
+    Type: String
+  EnableAutoRestacking:
+    AllowedValues: [false, true]
+    Default: false
+    Description: >-
+      "true" to enable automatic restacking of the instances with the latest
+      baseline AMI having the configured OS version; otherwise, "false"
+    Type: String
+  InstanceIAMPolicy:
+    Description: >-
+      IAM Policy to attach to the EC2 instance's IAM role
+    Default: ""
+    Type: String
+  EnableDomainName:
+    Description: >-
+      Check if Domain Name should be enabled for this instance
+    Default: false
+    Type: String
+    AllowedValues: [true, false]
+  HostedZoneName:
+    Description: >-
+      Name of Hosted Zone in which to add the DomainName record
+    Default: "vpc.internal."
+    Type: String
+  Timestamp:
+    Description: Timestamp
+    Default: ""
+    Type: String
+  IgnoreBootstrapErr:
+    Description: Whether or not we should ignore error from userdata bootstrap script
+    Default: false
+    Type: String
+    AllowedValues: [true, false]
+  CreateTimeout:
+    Description: How long to wait for instance bootstrap to complete
+    Default: PT10M
+    Type: String
+Conditions:
+  QueryAmiId: !Equals [!Ref AmiId, Auto]
+  SetKeyName: !Not [!Equals [!Ref KeyName, ""]]
+  CreateRestacker: !Equals [!Ref EnableAutoRestacking, true]
+  CreateDomainName: !Equals [!Ref EnableDomainName, true]
+  LookupBastionSGId: !Equals [!Ref BastionSecurityGroup, Auto]
+  LookupSubnetIds: !Equals [!Ref Subnets, Auto]
+  InstanceIAMPolicySet: !Not [!Equals [!Ref InstanceIAMPolicy, ""]]
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Ref AWS::StackName
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${Name}-${VpcId}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+       -
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        SourceSecurityGroupId:
+          Fn::If:
+            - LookupBastionSGId
+            -
+              Fn::ImportValue:
+                !Sub ${VpcId}:bastion-security-group:id
+            - !Ref BastionSecurityGroup
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        -
+          PolicyName: Policy
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action: ec2:AssociateAddress
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      BlockDeviceMappings:
+        -
+          DeviceName: /dev/sdf
+          Ebs: !GetAtt VolumeManager.Ebs
+      AssociatePublicIpAddress: false
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !If [QueryAmiId, !GetAtt AmiQuery.AmiId, !Ref AmiId]
+      InstanceType: !Ref InstanceType
+      KeyName: !If [SetKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SecurityGroups:
+        - !Ref SecurityGroup
+      UserData:
+        Fn::Base64:
+          !GetAtt GetUserData.UserScript
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub simple-ec2-${Name}-asg
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MaxSize: "2"
+      MinSize: "1"
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${Name}-${VpcId}
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Split
+        - ","
+        - Fn::If:
+          - LookupSubnetIds
+          - Fn::ImportValue: !Sub ${VpcId}:private-subnet:ids
+          - !Ref Subnets
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: !Ref CreateTimeout
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: !Ref CreateTimeout
+        WaitOnResourceSignals: true
+
+  GetUserDataFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Policy
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              -
+                Effect: Allow
+                Action:
+                  - s3:*Object
+                Resource: !Sub arn:aws:s3:::${UserDataScriptBucket}/*
+
+  GetUserDataFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/simple-ec2-${Name}-get-userdata
+      RetentionInDays: 7
+
+  GetUserDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${LambdaCodeBucket}-${AWS::Region}
+        S3Key: !Ref LambdaCodePath
+      Handler: get_userdata.handler
+      FunctionName: !Sub simple-ec2-${Name}-get-userdata
+      Role: !GetAtt GetUserDataFunctionRole.Arn
+      Runtime: python3.6
+      Timeout: 60
+
+  GetUserData:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GetUserDataFunction.Arn
+      UserDataBucket: !Sub ${UserDataScriptBucket}
+      UserDataScript: !Sub ${UserDataScriptName}
+      UserDataScriptEnvVar: !Sub ${UserDataScriptEnvVar}
+      StackName: !Sub ${AWS::StackName}
+      IgnoreBootstrapErr: !Ref IgnoreBootstrapErr
+
+  DomainNameFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateDomainName
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Policy
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              -
+                Effect: Allow
+                Action:
+                  - autoscaling:Describe*
+                  - ec2:Describe*
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHostedZone
+                  - route53:List*
+                Resource: "*"
+
+  DomainNameFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateDomainName
+    Properties:
+      LogGroupName: !Sub /aws/lambda/simple-ec2-${Name}-domain-name
+      RetentionInDays: 7
+
+  DomainNameFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateDomainName
+    Properties:
+      Code:
+        S3Bucket: !Sub ${LambdaCodeBucket}-${AWS::Region}
+        S3Key: !Ref LambdaCodePath
+      Handler: domain_name.handler
+      FunctionName: !Sub simple-ec2-${Name}-domain-name
+      Role: !GetAtt DomainNameFunctionRole.Arn
+      Runtime: python3.6
+      Timeout: 60
+
+  DomainNameResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateDomainName
+    Properties:
+      ServiceToken: !GetAtt DomainNameFunction.Arn
+      StackName: !Sub ${AWS::StackName}
+      VpcId: !Sub ${VpcId}
+      EnableDomainName: !Sub ${EnableDomainName}
+      HostedZoneName: !Sub ${HostedZoneName}
+      DomainName: !Ref Name
+      AsgName: !Ref AutoScalingGroup
+      Timestamp: !Ref Timestamp
+
+  RestackerRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRestacker
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        -
+          PolicyName: Policy
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - autoscaling:CreateLaunchConfiguration
+                  - autoscaling:DeleteLaunchConfiguration
+                  - autoscaling:Describe*
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - autoscaling:UpdateAutoScalingGroup
+                  - cloudformation:Describe*
+                  - ec2:CreateSnapshot*
+                  - ec2:Describe*
+                  - ec2:DetachVolume
+                  - ec2:AttachVolume
+                  - ec2:CopySnapshot
+                  - ec2:DeleteSnapshot
+                  - ec2:DeleteTags
+                  - ec2:CreateTags
+                  - ec2:ResetSnapshotAttribute
+                  - ec2:ImportSnapshot
+                  - ec2:ModifySnapshotAttribute
+                  - ec2:CreateSnapshot
+                  - iam:PassRole
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                  - iam:GetRole
+                Resource: "*"
+              -
+                Effect: Allow
+                Action: cloudformation:UpdateStack
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+
+  # Resources for managing EBS volume/snapshot during create/update
+  # For delete, we will have a separate flow since with delete, the dependency
+  # flow is reversed
+  VolumeManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${VolumeManagerFunction}
+      RetentionInDays: 7
+
+  VolumeManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+               - lambda.amazonaws.com
+            Action:
+             - sts:AssumeRole
+      Path: "/"
+      Policies:
+        -
+          PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot*
+                  - ec2:Describe*
+                  - ec2:DetachVolume
+                  - ec2:AttachVolume
+                  - ec2:CopySnapshot
+                  - ec2:DeleteSnapshot
+                  - ec2:DeleteTags
+                  - ec2:CreateTags
+                  - ec2:ResetSnapshotAttribute
+                  - ec2:ImportSnapshot
+                  - ec2:ModifySnapshotAttribute
+                  - ec2:CreateSnapshot
+                  - autoscaling:Describe*
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  VolumeManager:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt VolumeManagerFunction.Arn
+      StackName: !Ref "AWS::StackName"
+      AsgName: !Sub simple-ec2-${Name}-asg
+      Timestamp: !Ref Timestamp
+      DataVolumeSize: !Ref DataVolumeSize
+      Identifier: !Sub simple-ec2-${Name}
+
+  VolumeManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${LambdaCodeBucket}-${AWS::Region}
+        S3Key: !Ref LambdaCodePath
+      FunctionName: !Sub simple-ec2-${Name}-volume-manager
+      Handler: volume_manager.handler
+      Role: !GetAtt VolumeManagerRole.Arn
+      Runtime: python3.6
+      Timeout: 900
+
+  # Resources to create snapshot before stack deletion
+  LastSnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+               - lambda.amazonaws.com
+            Action:
+             - sts:AssumeRole
+      Path: "/"
+      Policies:
+        -
+          PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot*
+                  - ec2:Describe*
+                  - ec2:DetachVolume
+                  - ec2:AttachVolume
+                  - ec2:CopySnapshot
+                  - ec2:DeleteSnapshot
+                  - ec2:DeleteTags
+                  - ec2:CreateTags
+                  - ec2:ResetSnapshotAttribute
+                  - ec2:ImportSnapshot
+                  - ec2:ModifySnapshotAttribute
+                  - ec2:CreateSnapshot
+                  - autoscaling:Describe*
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  LastSnapshotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${LambdaCodeBucket}-${AWS::Region}
+        S3Key: !Ref LambdaCodePath
+      FunctionName: !Sub simple-ec2-${Name}-last-snapshot
+      Handler: last_snapshot.handler
+      Role: !GetAtt LastSnapshotRole.Arn
+      Runtime: python3.6
+      Timeout: 900
+
+  LastSnapshot:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt LastSnapshotFunction.Arn
+      StackName: !Ref "AWS::StackName"
+      AsgName: !Ref AutoScalingGroup
+      Identifier: !Sub simple-ec2-${Name}
+
+  LastSnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LastSnapshotFunction}
+      RetentionInDays: 7
+
+Outputs:
+  InstanceRole:
+    Description: The IAM role used by the EC2 instance
+    Value: !Ref InstanceRole
+  SecurityGroup:
+    Description: The Security Group used by the EC2 instance
+    Value: !Ref SecurityGroup
+  Asg:
+    Description: The Autoscaling Group the EC2 instance belongs to
+    Value: !Ref AutoScalingGroup
